@@ -1,0 +1,6 @@
+{
+  "name": "loot-staking",
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.4.0"
+  }
+}
