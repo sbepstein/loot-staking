@@ -4,16 +4,16 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 abstract contract RewardsDistributionRecipient is Ownable {
-    address public rewardsDistribution;
+    address public rewardsDistributor;
 
     function notifyRewardAmount(uint256 reward) virtual external;
 
-    modifier onlyRewardsDistribution() {
-        require(msg.sender == rewardsDistribution, "Caller is not RewardsDistribution contract");
+    modifier onlyRewardsDistributor() {
+        require(msg.sender == rewardsDistributor, "Caller is not RewardsDistribution contract");
         _;
     }
 
-    function setRewardsDistribution(address _rewardsDistribution) external onlyOwner {
-        rewardsDistribution = _rewardsDistribution;
+    function setRewardsDistributor(address _rewardsDistributor) external onlyOwner {
+        rewardsDistributor = _rewardsDistributor;
     }
 }

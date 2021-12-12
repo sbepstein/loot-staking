@@ -8,185 +8,245 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
-import "./interfaces/ILootStakingRewards.sol";
 import "./RewardsDistributionRecipient.sol";
-
-// NOTE: Still work in progress
 
 /**
  * @title Loot staking rewards contract
+ * @notice Staking is on a fixed time basis with a fixed reward amount.
+ * @dev This contract should be topped up with the rewards token before notifying of rewards.
  * @author Gary Thung
  */
-contract LootStakingRewards is ILootStakingRewards, RewardsDistributionRecipient, ReentrancyGuard, Pausable {
+contract LootStakingRewards is RewardsDistributionRecipient, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
+
+    struct StakingOption {
+        bool isActive;
+        uint256 reward;
+        uint256 duration;
+    }
+
+    struct StakingData {
+        address staker;
+        uint256 amount;
+        uint256 startTime;
+        uint256 endTime;
+    }
 
     /* ========== STATE VARIABLES ========== */
 
     IERC20 public rewardsToken;
     IERC721 public stakingToken;
-    uint256 public periodFinish = 0;
-    uint256 public rewardRate = 0; // TODO: fill in
-    uint256 public rewardsDuration = 7 days; // TODO: fill in
-    uint256 public lastUpdateTime;
-    uint256 public rewardPerTokenStored;
 
-    mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
 
-    uint256 private _totalSupply;
-    mapping(address => uint256) private _balances;
+    mapping(uint256 => StakingData) public staked; // Loot token ID => stake data
+
+    uint256 private _rewardsLocked; // amount of rewards due to stakers
+    uint256 private _rewardSupply; // amount of rewards in the contract
+    mapping(uint256 => StakingOption) private _stakingOptions;
+    uint256 private _totalStakingOptions;
 
     /* ========== CONSTRUCTOR ========== */
 
+    /**
+     * @param _rewardsDistributor The account that can modify the staking options and notify of available rewards
+     * @param _rewardsToken ERC20 token given as rewards
+     * @param _stakingToken ERC721 token that can be staked
+     * @param _optionsRewards Staking options to initialize; pairs with durations
+     * @param _optionsDurations Staking durations to initialize; pairs with rewards
+     */
     constructor(
-        address _owner,
-        address _rewardsDistribution,
+        address _rewardsDistributor,
         address _rewardsToken,
-        address _stakingToken
+        address _stakingToken,
+        uint256[] memory _optionsRewards,
+        uint256[] memory _optionsDurations
     ) {
+        rewardsDistributor = _rewardsDistributor;
         rewardsToken = IERC20(_rewardsToken);
         stakingToken = IERC721(_stakingToken);
-        rewardsDistribution = _rewardsDistribution;
+
+        // Initialize staking options
+        for (uint256 i = 0; i < _optionsRewards.length; i++) {
+            _addStakingOption(_optionsRewards[i], _optionsDurations[i]);
+        }
     }
 
     /* ========== VIEWS ========== */
 
-    function totalSupply() external view returns (uint256) {
-        return _totalSupply;
+    function rewardSupply() external view returns (uint256) {
+        return _rewardSupply;
     }
 
-    function balanceOf(address account) external view returns (uint256) {
-        return _balances[account];
+    function rewardsLocked() external view returns (uint256) {
+        return _rewardsLocked;
     }
 
-    function lastTimeRewardApplicable() public view returns (uint256) {
-        return block.timestamp < periodFinish ? block.timestamp : periodFinish;
-    }
-
-    function rewardPerToken() public view returns (uint256) {
-        if (_totalSupply == 0) {
-            return rewardPerTokenStored;
-        }
-
-        return rewardPerTokenStored + (
-            (lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18 / _totalSupply
-        );
-    }
-
-    function earned(address account) public view returns (uint256) {
-        return _balances[account] * (rewardPerToken() - userRewardPerTokenPaid[account]) / 1e18 + rewards[account];
-    }
-
-    function getRewardForDuration() external view returns (uint256) {
-        return rewardRate * rewardsDuration;
+    function rewardsAvailable() public view returns (uint256) {
+        return _rewardSupply - _rewardsLocked;
     }
 
     /* ========== MUTATIVE FUNCTIONS ========== */
 
-    function stake(uint256 tokenId) external nonReentrant whenNotPaused updateReward(msg.sender) {
-        _totalSupply += 1;
-        _balances[msg.sender] += 1;
-        stakingToken.safeTransferFrom(msg.sender, address(this), tokenId);
-        emit Staked(msg.sender, tokenId);
+    function stake(uint256 _tokenId, uint256 _optionId) external nonReentrant whenNotPaused {
+        _stake(_tokenId, _optionId);
     }
 
-    function withdraw(uint256 tokenId) public nonReentrant updateReward(msg.sender) {
-        _totalSupply -= 1;
-        _balances[msg.sender] -= 1;
-        stakingToken.safeTransferFrom(address(this), msg.sender, tokenId);
-        emit Withdrawn(msg.sender, tokenId);
+    function unstake(uint256 _tokenId) external nonReentrant whenNotPaused onlyLootOwner(_tokenId) {
+        _clearStakeData(_tokenId);
     }
 
-    function bulkStake(uint256[] memory tokenIds) external nonReentrant whenNotPaused updateReward(msg.sender) {
-        _totalSupply += tokenIds.length;
-        _balances[msg.sender] += tokenIds.length;
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            stakingToken.safeTransferFrom(msg.sender, address(this), tokenIds[i]);
-            emit Staked(msg.sender, tokenIds[i]);
+    function claim(uint256 _tokenId) external nonReentrant whenNotPaused {
+        _claim(_tokenId);
+    }
+
+    function bulkStake(uint256[] memory _tokenIds, uint256[] memory _optionIds) external nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            _stake(_tokenIds[i], _optionIds[i]);
         }
     }
 
-    function bulkWithdraw(uint256[] memory tokenIds) external nonReentrant whenNotPaused updateReward(msg.sender) {
-        _totalSupply -= tokenIds.length;
-        _balances[msg.sender] -= tokenIds.length;
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            stakingToken.safeTransferFrom(address(this), msg.sender, tokenIds[i]);
-            emit Staked(msg.sender, tokenIds[i]);
+    function bulkUnstake(uint256[] memory _tokenIds) external nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            require(msg.sender == stakingToken.ownerOf(_tokenIds[i]), "ERR_NOT_LOOT_OWNER");
+            _clearStakeData(_tokenIds[i]);
         }
     }
 
-    function getReward() public nonReentrant updateReward(msg.sender) {
-        uint256 reward = rewards[msg.sender];
-        if (reward > 0) {
-            rewards[msg.sender] = 0;
-            rewardsToken.safeTransfer(msg.sender, reward);
-            emit RewardPaid(msg.sender, reward);
+    function bulkClaim(uint256[] memory _tokenIds) external nonReentrant whenNotPaused {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            _claim(_tokenIds[i]);
         }
     }
 
-    function exit() external {
-        withdraw(_balances[msg.sender]);
-        getReward();
+    /* ========== PRIVATE FUNCTIONS ========== */
+
+    /**
+     * Delete the staking data for a given token ID.
+     *
+     * @param _tokenId The token ID to clear.
+     */
+    function _clearStakeData(uint256 _tokenId) private {
+        StakingData memory existingData = staked[_tokenId];
+
+        // Clear old stake if it exists
+        if (existingData.staker != address(0)) {
+            _rewardsLocked -= existingData.amount;
+            delete staked[_tokenId];
+            emit Unstaked(msg.sender, existingData.staker, _tokenId);
+        }
+    }
+
+    /**
+     * Adds a new staking option tier.
+     *
+     * @param _reward The amount of reward tokens given for staking
+     * @param _duration How long until the rewards are claimable
+     */
+    function _addStakingOption(uint256 _reward, uint256 _duration) private {
+        require(_reward != 0, "ERR_REWARD_ZERO");
+        require(_duration != 0, "ERR_DURATION_ZERO");
+        _stakingOptions[_totalStakingOptions] = StakingOption(true, _reward, _duration);
+        _totalStakingOptions += 1;
+        emit StakingOptionAdded(_reward, _duration);
+    }
+
+    /**
+     * Stakes a Loot token. Only callable by the current token owner.
+     *
+     * @param _tokenId The Loot token ID to stake
+     * @param _optionId The staking option ID to use
+     */
+    function _stake(uint256 _tokenId, uint256 _optionId) private onlyLootOwner(_tokenId) {
+        _clearStakeData(_tokenId);
+
+        // Fetch staking option data
+        StakingOption memory option = _stakingOptions[_optionId];
+        require(option.isActive, "ERR_STAKING_OPTION_INACTIVE");
+        require(rewardsAvailable() - option.reward >= 0, "ERR_REWARD_SUPPLY_TOO_LOW");
+
+        // Set staking state for this token
+        _rewardsLocked += option.reward;
+        staked[_tokenId] = StakingData(msg.sender, option.reward, block.timestamp, block.timestamp + option.duration);
+
+        emit Staked(msg.sender, _tokenId, _optionId);
+    }
+
+    /**
+     * Claims rewards for a staked Loot. Only valid if the caller is the original
+     * staker and the current token owner.
+     *
+     * @param _tokenId The Loot token ID to claim rewards for
+     */
+    function _claim(uint256 _tokenId) private onlyLootOwner(_tokenId) {
+        StakingData memory data = staked[_tokenId];
+
+        require(data.staker == msg.sender, "ERR_SENDER_NOT_STAKER");
+        require(block.timestamp >= data.endTime, "ERR_CLAIM_TOO_SOON");
+
+        // Update balances
+        _rewardsLocked -= data.amount;
+        _rewardSupply -= data.amount;
+
+        // Delete staking data
+        delete staked[_tokenId];
+
+        // Transfer staking rewards
+        rewardsToken.transfer(msg.sender, data.amount);
+
+        emit Claimed(msg.sender, _tokenId, data.amount);
     }
 
     /* ========== RESTRICTED FUNCTIONS ========== */
 
-    function notifyRewardAmount(uint256 reward) override external onlyRewardsDistribution updateReward(address(0)) {
-        if (block.timestamp >= periodFinish) {
-            rewardRate = reward / rewardsDuration;
-        } else {
-            uint256 remaining = periodFinish - block.timestamp;
-            uint256 leftover = remaining * rewardRate;
-            rewardRate = (reward + leftover) / rewardsDuration;
-        }
-
-        // Ensure the provided reward amount is not more than the balance in the contract.
-        // This keeps the reward rate in the right range, preventing overflows due to
-        // very high values of rewardRate in the earned and rewardsPerToken functions;
-        // Reward + leftover must be less than 2^256 / 10^18 to avoid overflow.
-        uint balance = rewardsToken.balanceOf(address(this));
-        require(rewardRate <= balance / rewardsDuration, "Provided reward too high");
-
-        lastUpdateTime = block.timestamp;
-        periodFinish = block.timestamp + rewardsDuration;
-        emit RewardAdded(reward);
+    /**
+     * Increases the available rewards supply. Only callable by the rewards
+     * distributor.
+     *
+     * @param _amount Additional rewards now avilable
+     */
+    function notifyRewardAmount(uint256 _amount) override external onlyRewardsDistributor {
+        _rewardSupply += _amount;
+        emit RewardsAdded(_amount);
     }
 
-    // Added to support recovering LP Rewards from other systems such as BAL to be distributed to holders
-    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyOwner {
-        require(tokenAddress != address(stakingToken), "Cannot withdraw the staking token");
-        IERC20(tokenAddress).safeTransfer(owner, tokenAmount);
-        emit Recovered(tokenAddress, tokenAmount);
+    /**
+     * External function for adding a new staking option tier. Only callable by
+     * the rewards distributor.
+     *
+     * @param _reward The amount of reward tokens given for staking
+     * @param _duration How long until the rewards are claimable
+     */
+    function addStakingOption(uint256 _reward, uint256 _duration) external onlyRewardsDistributor {
+        _addStakingOption(_reward, _duration);
     }
 
-    function setRewardsDuration(uint256 _rewardsDuration) external onlyOwner {
-        require(
-            block.timestamp > periodFinish,
-            "Previous rewards period must be complete before changing the duration for the new period"
-        );
-        rewardsDuration = _rewardsDuration;
-        emit RewardsDurationUpdated(rewardsDuration);
+    /**
+     * Disables a staking rewards tier. Only callable by the rewards distributor.
+     *
+     * @param _optionId Staking option to disable
+     */
+    function disableStakingOption(uint256 _optionId) external onlyRewardsDistributor {
+        StakingOption memory option = _stakingOptions[_optionId];
+        require(option.isActive, "ERR_STAKING_OPTION_INACTIVE");
+        _stakingOptions[_optionId].isActive = false;
+        emit StakingOptionDisabled(_optionId);
     }
 
     /* ========== MODIFIERS ========== */
 
-    // TODO: add modifier to address sticky situation between seller and new buyer
-    modifier updateReward(address account) {
-        rewardPerTokenStored = rewardPerToken();
-        lastUpdateTime = lastTimeRewardApplicable();
-        if (account != address(0)) {
-            rewards[account] = earned(account);
-            userRewardPerTokenPaid[account] = rewardPerTokenStored;
-        }
+    modifier onlyLootOwner(uint256 _tokenId) {
+        require(msg.sender == stakingToken.ownerOf(_tokenId), "ERR_NOT_LOOT_OWNER");
         _;
     }
 
     /* ========== EVENTS ========== */
 
-    event RewardAdded(uint256 reward);
-    event Staked(address indexed user, uint256 amount);
+    event RewardsAdded(uint256 reward);
+    event Staked(address indexed user, uint256 tokenId, uint256 optionId);
+    event Unstaked(address indexed unstaker, address indexed staker, uint256 tokenId);
     event Withdrawn(address indexed user, uint256 amount);
-    event RewardPaid(address indexed user, uint256 reward);
-    event RewardsDurationUpdated(uint256 newDuration);
-    event Recovered(address token, uint256 amount);
+    event Claimed(address indexed user, uint256 tokenId, uint256 amount);
+    event StakingOptionAdded(uint256 reward, uint256 duration);
+    event StakingOptionDisabled(uint256 optionId);
 }
