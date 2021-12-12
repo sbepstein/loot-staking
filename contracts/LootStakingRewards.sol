@@ -37,8 +37,6 @@ contract LootStakingRewards is RewardsDistributionRecipient, ReentrancyGuard, Pa
     IERC20 public rewardsToken;
     IERC721 public stakingToken;
 
-    mapping(address => uint256) public rewards;
-
     mapping(uint256 => StakingData) public staked; // Loot token ID => stake data
 
     uint256 private _rewardsLocked; // amount of rewards due to stakers
